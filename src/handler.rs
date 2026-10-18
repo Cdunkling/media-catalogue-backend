@@ -1,19 +1,13 @@
 use crate::{
     AppState,
-    schema::CreateUserSchema,
-    schema::CreateGameSchema,
-    schema::CreatePlatformSchema,
-    schema::UpdatePasswordSchema,
-    schema::UpdateUserSchema,
     schema::UserOut,
     schema::FilterOptions,
     model::GameModel,
     model::UserModel,
     model::PlatformModel,
+    schema::{GameInput, GamePatch, PasswordChange, PlatformInput, UserInput, UserPatch}
 };
 use actix_web::{delete, get, patch, post, web, HttpResponse, Responder};
-use actix_web::web::service;
-use chrono::prelude::*;
 use serde_json::json;
 use argon2::{password_hash::PasswordHasher, password_hash::PasswordVerifier, Argon2, PasswordHash};
 use password_hash::phc::SaltString;
@@ -60,7 +54,7 @@ pub async fn user_list_handler(
 
 #[post("/users")]
 async fn create_user_handler(
-    body: web::Json<CreateUserSchema>,
+    body: web::Json<UserInput>,
     data: web::Data<AppState>,
 ) -> impl Responder {
     if !(3..=50).contains(&body.username.len()) {
@@ -155,7 +149,7 @@ async fn get_user_handler(
 #[post("/users/{id}/password")]
 async fn edit_pass_handler(
     path: web::Path<i32>,
-    body: web::Json<UpdatePasswordSchema>,
+    body: web::Json<PasswordChange>,
     data: web::Data<AppState>,
 ) -> impl Responder {
     let user_id = path.into_inner();
@@ -221,7 +215,7 @@ async fn edit_pass_handler(
 #[patch("/users/{id}")]
 async fn edit_user_handler(
     path: web::Path<i32>,
-    body: web::Json<UpdateUserSchema>,
+    body: web::Json<UserPatch>,
     data: web::Data<AppState>,
 ) -> impl Responder {
     let user_id = path.into_inner();
@@ -327,7 +321,7 @@ pub async fn game_list_handler(
 
 #[post("/games")]
 async fn create_game_handler(
-    body: web::Json<CreateGameSchema>,
+    body: web::Json<GameInput>,
     data: web::Data<AppState>,
 ) -> impl Responder {
     if (body.title.len()==0) {
@@ -433,30 +427,23 @@ async fn get_game_handler(
 #[patch("/games/{id}")]
 async fn edit_game_handler(
     path: web::Path<i32>,
-    body: web::Json<CreateGameSchema>,
+    body: web::Json<GamePatch>,
     data: web::Data<AppState>,
 ) -> impl Responder {
     let game_id = path.into_inner();
-    let query_result = sqlx::query_as!(
+    let result = sqlx::query_as!(
         GameModel,
-        "SELECT * FROM games WHERE ID = $1",
-        game_id
-    )
-    .fetch_one(&data.db)
-    .await;
-
-    if query_result.is_err() {
-        let message = format!("game with ID: {} not found", game_id);
-        return HttpResponse::NotFound()
-            .json(serde_json::json!({"status": "fail","message": message}));
-    }
-
-    let now =  Utc::now();
-    let game = query_result.unwrap();
-
-    let query_result = sqlx::query_as!(
-        GameModel,
-        "UPDATE games SET title=$1, description=$2, genre=$3, price_paid=$4, barcode=$5, region=$6, year_released=$7,last_updated=$8 WHERE ID = $9 RETURNING *",
+        r#"UPDATE games SET
+                 title=coalesce($1,title),
+                 description=coalesce($2,description),
+                 genre=coalesce($3,genre),
+                 price_paid=coalesce($4,price_paid),
+                 barcode=coalesce($5,barcode),
+                 region=coalesce($6,region),
+                 year_released=coalesce($7,year_released),
+                 last_updated=now()
+             WHERE ID = $8
+             RETURNING *"#,
         body.title.to_owned(),
         body.description.to_owned(),
         body.genre.to_owned(),
@@ -464,24 +451,23 @@ async fn edit_game_handler(
         body.barcode.to_owned(),
         body.region.to_owned(),
         body.year_released.to_owned(),
-        now,
         game_id,
     )
-    .fetch_one(&data.db)
+    .fetch_optional(&data.db)
     .await;
 
-    match query_result {
-        Ok(game) => {
-            let game_response = serde_json::json!({"status": "success","data": serde_json::json!({
-                "game": game
-            })});
-
-            return HttpResponse::Ok().json(game_response);
+    match result {
+        Ok(Some(game)) => HttpResponse::Ok()
+            .json(serde_json::json!({"status": "success","data": {"game":game}})),
+        Ok(None) => HttpResponse::NotFound()
+            .json(serde_json::json!({"status": "fail","message": "Game not found"})),
+        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => {
+            HttpResponse::Conflict()
+                .json(serde_json::json!({"status": "fail","message": "Game already exists"}))
         }
-        Err(err) => {
-            let message = format!("Error: {:?}", err);
-            return HttpResponse::InternalServerError()
-                .json(serde_json::json!({"status": "error","message": message}));
+        Err(e) => {
+            HttpResponse::InternalServerError()
+                .json(serde_json::json!({"status": "error", "message": "Internal error"}))
         }
     }
 }
@@ -492,18 +478,23 @@ async fn delete_game_handler(
     data: web::Data<AppState>,
 ) -> impl Responder {
     let game_id = path.into_inner();
-    let rows_affected = sqlx::query!("DELETE FROM games  WHERE ID = $1", game_id)
+
+    match sqlx::query!("DELETE FROM games WHERE id = $1", game_id)
         .execute(&data.db)
         .await
-        .unwrap()
-        .rows_affected();
-
-    if rows_affected == 0 {
-        let message = format!("game with ID: {} not found", game_id);
-        return HttpResponse::NotFound().json(json!({"status": "fail","message": message}));
+    {
+        Ok(res) if res.rows_affected() == 0 => HttpResponse::NotFound()
+            .json(serde_json::json!({"status": "fail", "message": "User not found"})),
+        Ok(_) => HttpResponse::NoContent().finish(),
+        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23503") => {
+            HttpResponse::Conflict().json(serde_json::json!({"status": "fail","message": "Game still has data that references it"}))
+        }
+        Err(e) => {
+            eprintln!("error deleting game: {e:?}");
+            HttpResponse::InternalServerError()
+                .json(json!({"status": "error", "message": "Internal error"}))
+        }
     }
-
-    HttpResponse::NoContent().finish()
 }
 
 
@@ -541,7 +532,7 @@ pub async fn platform_list_handler(
 }
 #[post("/platforms")]
 async fn create_platform_handler(
-    body: web::Json<CreatePlatformSchema>,
+    body: web::Json<PlatformInput>,
     data: web::Data<AppState>,
 ) -> impl Responder {
     let query_result = sqlx::query_as!(
