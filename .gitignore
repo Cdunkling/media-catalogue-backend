@@ -2,3 +2,7 @@
 /target
 .env.swp
 .DS_Store
+.idea/vcs.xml
+.idea/modules.xml
+.idea/media-catalogue-backend.iml
+.idea/dataSources.xml
