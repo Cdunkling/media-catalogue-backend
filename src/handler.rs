@@ -308,7 +308,7 @@ pub async fn platform_list_handler(
 
     match query_result {
         Ok(platform) => HttpResponse::Created()
-            .json(json!({"status": "success", "data": {"platform": platform}})),
+            .json(json!({"status": "success", "data": {"platforms": platform}})),
 
         Err(e) => {
             eprintln!("failed to list platforms: {e}");
